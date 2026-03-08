@@ -5,12 +5,14 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include "Log.hpp"
 #include "Channel.hpp"
 #include "Poller.hpp"
 
 
-class channel;
+class Channel;
 class EventLoop {
 private:
     using Functor = std::function<void()>;
@@ -36,9 +38,51 @@ private:
     Poller _poller;                                 // 对所有描述符的事件监控
 
 private:
-    static int CreateEventfd();
-    void ReadWakeupFd();  // 读取_wakeup_fd事件通知次数
-    void RunAllTasks();   // 执行任务池中的所有任务
+    // 为啥用static？
+    // 因为eventfd只能在一个进程内使用，所以只需要一个全局的eventfd就可以了
+    static int CreateEventfd() {
+        int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if(efd < 0) {
+            LOG_ERR("eventfd error: %s\n", strerror(errno));
+            abort();
+        }
+        return efd;
+    }
+
+    // 读取_wakeup_fd事件通知次数
+    void ReadWakeupFd() {
+        uint64_t res = 0;
+        int ret = ::read(_wakeup_fd, &res, sizeof(res));
+        if(ret < 0) {
+            // EINTR被信号打断      EAGAIN表示没有数据可读
+            if(errno == EINTR || errno == EAGAIN) return;
+            LOG_ERR("read _wakeup_fd error: %s\n", strerror(errno));
+            abort();
+        }
+    }
+    // 写入_wakeup_fd事件通知次数
+    void WeakUpEventfd() {
+        uint64_t val = 1;
+        int ret = ::write(_wakeup_fd, &val, sizeof(val));
+        if(ret < 0) {
+            if(errno == EINTR) return;
+            LOG_ERR("write _wakeup_fd error: %s\n", strerror(errno));
+            abort();
+        }
+    }
+
+    // 执行任务池中的所有任务
+    void RunAllTasks() {
+        std::vector<Functor> tasks;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            tasks.swap(_tasks_poll);
+        }
+        for(auto& task : tasks) { 
+            task();
+        }
+    }  
+
 public:
     EventLoop() :_thread_id(std::this_thread::get_id())
                 ,_wakeup_fd(CreateEventfd()) 
@@ -89,9 +133,10 @@ public:
 
     // 添加/修改描述符的事件监控
     void UpdateEvent(Channel* channel) { return _poller.UpdateEvent(channel); }
+    // 移除描述符的事件监控
+    void RemoveEvent(Channel* channel) { return _poller.RemoveEvent(channel); }
 
-
-    ~EventLoop();
+    ~EventLoop(){}
 };
 
 
