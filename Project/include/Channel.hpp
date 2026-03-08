@@ -2,15 +2,17 @@
 #include <cstdint>
 #include <functional>
 #include <sys/epoll.h>
-#include "Poller.hpp"
-
-class Poller;
+// #include "Poller.hpp"
+#include "EventLoop.hpp"
+// class Poller; // 测试结束，现在需要改成EventLoop对象定义的
+class EventLoop;
 class Channel {
     // 事件回调函数类型定义
     using EventCallback = std::function<void()>;
 private:
     int _fd;
-    Poller* _poller;
+    // Poller* _poller;   // 后续要改成EventLoop对象定义的，Poller只是临时测试
+    EventLoop* _loop;  // 改成EventLoop对象定义的
     uint32_t _events;  // 关注的事件
     uint32_t _revents; // 实际发生的事件
     // 这些回调函数都是Connection实现的，Channel只负责调用它们
@@ -22,7 +24,7 @@ private:
 public:
     // Channel只负责监控事件的发生，不负责事件的处理
     // 所以它不需要知道事件发生时应该调用哪个具体的回调函数，这些回调函数由Connection来设置和实现
-    Channel(int fd, Poller* poller) : _fd(fd), _poller(poller),  _events(0), _revents(0) {}
+    Channel(int fd, EventLoop* loop) : _fd(fd), _loop(loop),  _events(0), _revents(0) {}
     int GetFd() const { return _fd; }
     uint32_t GetEvents() const { return _events; }          // 获取想要监控的事件
     void SetEvents(uint32_t events) { _events = events; }   // 设置实际就绪的事件

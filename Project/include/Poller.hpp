@@ -97,8 +97,3 @@ public:
     }
 };
 
-#include "Channel.hpp"
-    // 移除监控，把红黑树上这个节点删除掉
-    void Channel::Remove() { _poller->RemoveEvent(this); }
-    // 更新监控
-    void Channel::Update() { _poller->UpdateEvent(this); }
