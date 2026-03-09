@@ -1,8 +1,7 @@
-#include "../include/EventLoop.hpp"
+#include "../include/server.hpp"
 
 int main() {
     EventLoop loop;
-    loop.StartLoop();
     return 0;
 
 }
