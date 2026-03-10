@@ -826,9 +826,238 @@ public:
     bool HasTimer(uint64_t id) const {
         return _timer_wheel.HasTimer(id);
     }
-    ~EventLoop(){}
 };
+// ===================================================================================================================================
 
+
+// ========================================= LoopThread ===========================================
+class LoopThread {
+private:
+    std::mutex _mutex;                          // 互斥锁，保护线程安全     
+    std::condition_variable _cond;              // 条件变量，用于线程同步
+    EventLoop* _loop;                           // EventLoop对象指针，这个对象要在线程内实例化
+    std::thread _thread;                        // EventLoop对应的线程
+private:
+    // 实例化EventLoop对象，唤醒_cond上有可能阻塞的线程，并开始运行EventLoop模块功能
+    void ThreadEntry() {
+        EventLoop loop;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _loop = &loop;
+            _cond.notify_all();     // 为啥要广播？因为可能有多个线程在等待EventLoop对象的实例化
+        }
+        loop.StartLoop();
+    }
+public:
+    LoopThread() : _loop(nullptr) ,_thread(std::bind(&LoopThread::ThreadEntry, this)) {}
+
+    // 返回当前线程关联的EventLoop对象指针
+    EventLoop* GetEventLoop() { 
+        EventLoop* loop = nullptr;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _cond.wait(_lock, [this](){ return _loop != nullptr; });    // loop不为空时，唤醒线程
+            loop = _loop;
+        }
+        return loop;
+    }
+};
+// ===================================================================================================================================
+
+
+// ========================================= LoopThreadPool =========================================================================
+class LoopThreadPool{
+private:
+    int _thread_cnt;                 // 从属线程数量
+    int _next_idx;                  // 下一个线程索引
+    EventLoop* _base_loop;          // 主EventLoop，运行在主线程，为啥用指针？因为要在子线程中使用，子线程要调用主EventLoop的方法
+    std::vector<LoopThread*> _threads;          // 线程池
+    std::vector<EventLoop*> _loops;             // 线程池中的EventLoop对象指针
+public:
+    LoopThreadPool(EventLoop* base_loop) : _thread_cnt(0) , _next_idx(0) , _base_loop(base_loop) {}
+    void SetThreadCnt(int thread_cnt) { _thread_cnt = thread_cnt; }
+    // 创建线程池中的线程
+    void CreateThreads() {
+        if(_thread_cnt > 0) {
+            _threads.resize(_thread_cnt);
+            _loops.resize(_thread_cnt);
+            for(int i = 0; i < _thread_cnt; ++i) {
+                _threads[i] = new LoopThread();
+                _loops[i] = _threads[i]->GetEventLoop();
+            }
+        }
+    }
+
+    // 获取下一个EventLoop对象指针，轮询方式
+    EventLoop* GetNextLoop() {
+        if(_thread_cnt == 0) return _base_loop;
+        _next_idx = (_next_idx + 1) % _thread_cnt;
+        return _loops[_next_idx];
+    }
+};
+// ===================================================================================================================================
+
+// ============================================================= Any =========================================================================
+class Any{
+private:
+    class holder{
+    public:
+        virtual ~holder() {}
+        virtual const std::type_info& Type() = 0;
+        virtual void* Clone() = 0;
+    };
+
+    template<typename T>
+    class placeholder : public holder{
+    public:
+        placeholder(const T& val) : _val(val) {}
+        // 获取子类对象保存的数据
+        virtual const std::type_info& Type() override { return typeid(T); }
+        // 克隆子类对象
+        virtual void* Clone() override { return new placeholder(_val); }
+    private:
+        T _val;
+    };
+    holder* _content;
+
+public:
+    Any() : _content(nullptr) {}
+    template<typename T>
+    Any(const T& val) : _content(new placeholder<T>(val)) {}
+    Any(const Any& other) : _content(other._content ? static_cast<holder*>(other._content->Clone()) : nullptr) {}
+    ~Any() { delete _content; }
+
+    Any& swap(Any& other) {
+        std::swap(_content, other._content);
+        return *this;
+    }
+
+    // 返回子类对象保存的数据指针
+    template<typename T>
+    T* Get() { 
+        // 必须和保存的数据类型一直
+        assert(typeid(T) == _content->Type());
+        // 返回子类对象保存的数据指针
+        return &((placeholder<T>*)_content)->_val;
+    }
+
+    // 赋值运算符重载
+    template<typename T>
+    Any& operator=(const T& val) {
+        Any(val).swap(*this);
+        return *this;
+    }
+    Any& operator=(const Any& other) {
+        Any(other).swap(*this);
+        return *this;
+    }
+
+};
+// ===================================================================================================================================
+
+// =========================================  Connection ==============================================================================
+
+class Connection;
+
+typedef enum {
+    DISCONNECTED,       // 连接关闭
+    CONNECTING,         // 连接建立成功，待处理
+    CONNECTED,          // 连接已建立, 已完成握手，可通信
+    DISCONNECTING      // 待关闭状态 
+}ConnStatus;
+using PtrConnection = std::shared_ptr<Connection>;
+class Connection : public std::enable_shared_from_this<Connection> {
+private:
+    uint64_t _conn_id;                       // 连接ID，全局唯一，便于管理和查找
+    int _sockfd;                             // 连接套接字描述符
+    bool _enable_inactive_release;           // 是否启用 inactive 连接释放
+    EventLoop* _loop;                        // 连接关联的EventLoop对象指针
+    ConnStatus _status;                      // 连接状态
+    Socket _socket;                          // 套接字操作管理
+    Channel _channel;                        // 连接的事件管理
+    Buffer _in_buffer;                       // 输入缓冲区,存从socket中读到的数据
+    Buffer _out_buffer;                      // 输出缓冲区，存要发给对端的数据
+    Any _context;                            // 连接上下文，用户自定义数据
+
+    // 这四个回调函数，是让服务器模块来设置的，服务器模块在连接建立成功、消息到达、连接关闭、任意事件发生时，会调用对应的回调函数
+    using ConnectedCallback = std::function<void(PtrConnection&)>;
+    // PtrConnection 是智能指针，引用不能为空
+    // Buffer* 是普通指针，可能为空
+    using MessageCallback = std::function<void(PtrConnection&, Buffer*)>;
+    using CloseCallback = std::function<void(PtrConnection&)>;
+    using AnyEventCallback = std::function<void(PtrConnection&)>;
+    ConnectedCallback _connected_cb;        // 连接建立成功回调
+    MessageCallback _message_cb;            // 消息到达回调
+    // 组件内的连接关闭回调--组件内设置的，因为服务器组件内会把所有的连接管理起来
+    // 一旦某个连接关闭，就应该从管理的地方移除掉自己的信息
+    CloseCallback _close_cb;                // 连接关闭回调
+    AnyEventCallback _any_event_cb;         // 任意事件回调
+private:
+    // Channel 层的事件回调函数，会调用 Connection 层的事件回调函数
+    // 描述符可读事件触发后调用的函数，接收socket数据放到接收缓冲区中，调用_message_cb
+    void HandleRead() {
+        // 1. 接收socket的数据放到缓冲区
+        char buf[65536];
+        ssize_t ret = _socket.NonBlockRecv(buf, 65536);
+        if(ret < 0) {
+            // 出错了不能直接关闭连接，要检查缓冲区是否空了！
+            ShutdownInLoop();
+        }
+        // 0 表示没读到数据，-1表示连接断开
+        // 把数据放入输入缓冲区
+        _in_buffer.Write(buf,ret);
+
+        // 2. 调用回调
+        if(_in_buffer.GetReadableSize() > 0) {
+            if (_message_cb) {
+                _message_cb(shared_from_this(), &_in_buffer);
+            }
+        }
+    }
+    void HandleWrite();
+    void HandleClose();
+    void HandleAnyEvent();
+    void HandleError();
+
+    void EstablishedInLoop();
+    void ReleaseInLoop();
+    void SendInLoop(Buffer& buf);
+    void ShutdownInLoop();
+    void EnableInactiveReleaseInLoop(int sec);
+    void CancelInactiveReleaseInLoop();
+
+    // 切换协议--重置上下文及阶段性回调函数
+    void UpgradeInLoop(const Any& context,
+                       const ConnectedCallback& connected_cb,
+                       const MessageCallback& message_cb,
+                       const CloseCallback& close_cb,
+                       const AnyEventCallback& any_event_cb);
+
+public:
+    int GetConnId() const { return _conn_id; }
+    int GetSockfd() const { return _sockfd; }
+    bool Connected() const { return _status == CONNECTED; }
+    void SetContext(const Any& context) { _context = context; }
+
+    // 获取上下文，返回指针
+    Any* GetContext() { return &_context; }
+    void SetConnectedCallback(const ConnectedCallback& cb) { _connected_cb = cb; }
+    void SetMessageCallback(const MessageCallback& cb) { _message_cb = cb; }
+    void SetCloseCallback(const CloseCallback& cb) { _close_cb = cb; }
+    void SetAnyEventCallback(const AnyEventCallback& cb) { _any_event_cb = cb; }
+
+    void Established();
+    void Send(const char* data, size_t len);
+    void Shutdown();
+    void Release();
+    void EnableInactiveRelease(int sec);
+    void CancelInactiveRelease();
+    void Upgrade(const Any& context,
+                 const ConnectedCallback& connected_cb,
+                 const MessageCallback& message_cb,
+                 const CloseCallback& close_cb,
+                 const AnyEventCallback& any_event_cb);
+};
 
 // 移除监控，把红黑树上这个节点删除掉
 void Channel::Remove() { _loop->RemoveEvent(this); }
