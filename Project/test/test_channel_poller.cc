@@ -1,7 +1,6 @@
 #include <iostream>
 #include <map>
-#include "../src/copy.hpp"
-
+#include "../src/server.hpp"
 int main() {
     // 创建服务器Socket
     Socket listen_sock;
