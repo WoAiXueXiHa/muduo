@@ -1040,6 +1040,7 @@ private:
         // 一旦启动读事件监控就有可能会理解触发读事件，而如果这时候启动了非活跃连接销毁
         // 会刷新活跃度，延迟销毁
         // 所以启动读事件不能放到构造里
+        _status = CONNECTED;
         _channel.enableRead();
         if(_connectedCallBack) _connectedCallBack(shared_from_this());
     }
@@ -1162,6 +1163,7 @@ public:
 
     // 发送数据
     void Send(const char* data, size_t len) {
+        if (_status != CONNECTED) return;
         // 外界传入的data可能是个临时空间，我们只把发送操作压入任务池
         Buffer buf;
         buf.WriteAndMove(data, len);
@@ -1215,6 +1217,7 @@ private:
     }
 
     int createServer(int port) {
+        //DBG_LOG("====Acceptor创建监听套接字，端口===");
         bool ret = _socket.createServer(port);
         assert(ret == true);
         return _socket.getFd();
@@ -1223,11 +1226,15 @@ private:
 public:
     Acceptor(EventLoop* loop, int port) : _loop(loop), _socket(createServer(port)),
             _channel(_socket.getFd(), loop) {
+        //DBG_LOG("====Acceptor内部构造，看下_loop的地址：%p===", _loop);
         _channel.setReadCallback(std::bind(&Acceptor::handleRead, this));
     }
 
     void setAcceptCallBack(const AcceptCallBack& cb) { _acceptCallBack = cb; }
-    void Listen() { _channel.enableRead(); }
+    void Listen() { 
+       // DBG_LOG("====Acceptor开始监听,Listen被调用----");
+        _channel.enableRead(); 
+    }
 };
 
 // ===========================================================================================================
@@ -1239,7 +1246,7 @@ private:
     int _port;              // 监听端口
     int _timeout;           // 非活跃连接的统计时间--多长时间五通信就是非活跃连接
     bool _enableInactiveRelease;  // 是否允许非活跃连接自动释放
-    EventLoop* _baseLoop;        // 主线程的EventLoop对象，负责监听事件的处理
+    EventLoop _baseLoop;        // 主线程的EventLoop对象，负责监听事件的处理
     Acceptor _acceptor;     // 监听套接字
     LoopThreadPool _pool;   // 从属EventLoop线程池
     std::unordered_map<uint64_t, ptrConnection> _connMap;  // 连接管理表
@@ -1258,7 +1265,7 @@ private:
 private:
     void runAfterInLoop(const Functor& task, int delay) {
         _nextId++;
-        _baseLoop->timerAdd(_nextId, delay, task);
+        _baseLoop.timerAdd(_nextId, delay, task);
     }
     void removeConnection(const ptrConnection& conn) {
         int id = conn->getId();
@@ -1282,11 +1289,15 @@ private:
 public:
     TcpServer(int port) : _port(port), _nextId(0) 
         ,_enableInactiveRelease(false), 
-        _acceptor(_baseLoop, port)
-        ,_pool(_baseLoop)
+        _acceptor(&_baseLoop, port)
+        ,_pool(&_baseLoop)
     {
+       // DBG_LOG("-----TcpServer构造内：设置accept回调----");
         _acceptor.setAcceptCallBack(std::bind(&TcpServer::newConnection, this, std::placeholders::_1));
+       // DBG_LOG("-----TcpServer构造内：执行监听----");
         _acceptor.Listen();
+      //  DBG_LOG("-----TcpServer构造内：构造结束----");
+
     }
 
     void setThreadCnt(int cnt) { _pool.setThreadCnt(cnt); }
@@ -1298,9 +1309,9 @@ public:
 
     // 添加一个定时任务
     void runAfter(const Functor& task, int delay) {
-        _baseLoop->runInLoop(std::bind(&TcpServer::runAfterInLoop, this, task, delay));
+        _baseLoop.runInLoop(std::bind(&TcpServer::runAfterInLoop, this, task, delay));
     }
-    void Loop() { _pool.createThreads(); _baseLoop->Loop(); }
+    void Loop() { _pool.createThreads(); _baseLoop.Loop(); }
 };
 
 
