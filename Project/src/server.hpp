@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <sys/epoll.h>
 #include <poll.h>
+#include <signal.h>
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
@@ -1221,7 +1222,7 @@ private:
 
 public:
     Acceptor(EventLoop* loop, int port) : _loop(loop), _socket(createServer(port)),
-            _channel(loop, _socket.getFd()) {
+            _channel(_socket.getFd(), loop) {
         _channel.setReadCallback(std::bind(&Acceptor::handleRead, this));
     }
 
@@ -1281,8 +1282,8 @@ private:
 public:
     TcpServer(int port) : _port(port), _nextId(0) 
         ,_enableInactiveRelease(false), 
-        _acceptor(&_baseLoop, port)
-        ,_pool(&_baseLoop)
+        _acceptor(_baseLoop, port)
+        ,_pool(_baseLoop)
     {
         _acceptor.setAcceptCallBack(std::bind(&TcpServer::newConnection, this, std::placeholders::_1));
         _acceptor.Listen();
@@ -1294,6 +1295,12 @@ public:
     void setClosedCallBack(const ClosedCallBack& cb) { _closedCallBack = cb; }
     void setAnyEventCallBack(const AnyEventCallBack& cb) { _anyEventCallBack = cb; }
     void setEnableInactiveRelease(int sec) { _timeout = sec; _enableInactiveRelease = true; }
+
+    // 添加一个定时任务
+    void runAfter(const Functor& task, int delay) {
+        _baseLoop->runInLoop(std::bind(&TcpServer::runAfterInLoop, this, task, delay));
+    }
+    void Loop() { _pool.createThreads(); _baseLoop->Loop(); }
 };
 
 
@@ -1322,3 +1329,12 @@ void TimerWheel::timerRefresh(uint64_t id) {
 void TimerWheel::timerCancel(uint64_t id) {
     _loop->runInLoop(std::bind(&TimerWheel::timerCancelInWheel, this, id));
 }
+
+class NetWork {
+public:
+    NetWork() {
+        DBG_LOG("SIGPIE INIT");
+        signal(SIGPIPE, SIG_IGN);
+    }
+};
+static NetWork nw;
