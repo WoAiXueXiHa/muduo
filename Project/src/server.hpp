@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <sys/eventfd.h>
 
-// ================================== 日志宏 ==================================
+// ================================== 物理设施层 ==================================
 #define INF 0
 #define DBG 1
 #define ERR 2
@@ -47,10 +47,59 @@
 #define INF_LOG(format, ...) LOG(INF, format, ##__VA_ARGS__)
 #define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
 #define ERR_LOG(format, ...) LOG(ERR, format, ##__VA_ARGS__)
-// ===============================================================================
 
+class Any {
+private:
+    class holder {
+    public:
+        virtual ~holder() {}
+        virtual const std::type_info& type() const = 0;
+        virtual holder* clone() = 0;
+    };
+    template <class T>
+    class placeHolder : public holder {
+    public:
+        T _val;
+        placeHolder(const T& val) : _val(val) {}
+        virtual const std::type_info& type() const { return typeid(T); }
+        virtual holder* clone() { return new placeHolder(_val); }
+    };
 
-// ================================== Buffer ==================================
+    holder* _content;
+public:
+    Any() :_content(nullptr) {}
+    template <class T>
+    Any(const T& val) :_content(new placeHolder<T>(val)) {}
+    Any(const Any& other) :_content(other._content? other._content->clone() : nullptr) {}
+    ~Any() { delete _content; }
+
+    Any& swap(Any& other) {
+        std::swap(_content, other._content);
+        return *this;
+    }
+
+    // 返回子类对象保存的数据的指针
+    template <class T>
+    T* getPtr() {
+        // 类型检查
+        assert(typeid(T) == _content->type());
+        // 先强转成placeHolder<T>指针，再取值，最后取地址
+        return &((placeHolder<T>*)_content)->_val;
+    }
+
+    template <class T>
+    Any& operator=(const T& val) {
+        //为val构造一个临时的通用容器，然后与当前容器自身进行指针交换，临时对象释放的时候，原先保存的数据也就被释放
+        Any(val).swap(*this);
+        return *this;
+    }
+
+    Any& operator=(const Any& other) {
+        Any(other).swap(*this);
+        return *this;
+    }
+};
+
 #define BUFFER_SIZE (1024*1024) // 1M
 class Buffer{
 private:
@@ -66,11 +115,9 @@ public:
     char* getReadIndex() { return Begin() + _readIndex; }
    
     // 获取头尾空闲空间大小
-    uint64_t getHeadSize() { return _readIndex; }   // 读索引之前
+    uint64_t getHeadSize() { return _readIndex; }                      // 读索引之前，已经被读走，头部废弃空间
     uint64_t getTailSize() { return _buffer.size() - _writeIndex; }    // 总空间-写索引->剩下就是尾部空间
-
-    // 获取可读数据大小 写偏移-读偏移
-    uint64_t getReadableSize() { return _writeIndex - _readIndex; }
+    uint64_t getReadableSize() { return _writeIndex - _readIndex; }    // 夹在中间、真正有用的未读数据大小
     
     // 读写指针移动
     void moveReadOffset(uint64_t len) {
@@ -79,6 +126,7 @@ public:
         assert(len <= getReadableSize());
         _readIndex += len;
     }
+    // 写指针移动
     void moveWriteOffset(uint64_t len) {
         if(0 == len) return;
         // 向后移动的大小，必须小于当前后边的空闲空间大小
@@ -87,20 +135,19 @@ public:
     }
 
     // 确保可写空间足够（整体空间够了就移动数据，否则扩容）
+    // 解决内存碎片问题
     void ensureWriteable(uint64_t len) {
         // 最优情况：缓冲区末尾空闲空间足够，直接返回
         if(len <= getTailSize()) return;
 
         // 走到这里，说明尾部空间不够
-        // 无论是后续复用头部空间还是扩容
-        // 必须先把有效数据移动到头部空间！
+        // 如果 头部空闲空间 + 尾部空闲空间 能够装的下len 就没必要扩容 只需要把有效数据往前挪
         uint64_t readableSize = getReadableSize();
-        // 整理内存碎片
         std::copy(getReadIndex(), getReadIndex() + readableSize, Begin());
         _readIndex = 0;
         _writeIndex = readableSize;
 
-        // 整理完碎片后，再次检查尾部空间是否足够
+        // 挪完之后 发现尾部还是不够 才调用resize扩容
         if(getTailSize() < len) {
             // 此时_buffer里0到_writeIndex全是有效数据
             LOG(DBG, "buffer expand to %lu", _buffer.size() + len);
@@ -146,6 +193,7 @@ public:
     }
 
     // 提供各种类型的读取
+    // 零拷贝读取！
     std::string readString(uint64_t len) {
         if(0 == len) return "";
         assert(len <= getReadableSize());
@@ -190,9 +238,7 @@ public:
         _writeIndex = 0;
     }
 };
-// ===============================================================================
 
-// ================================ Socket =======================================
 #define MAX_LISTEN 1024
 class Socket{
 private:
@@ -372,9 +418,8 @@ public:
     }
 };
 
-// ===============================================================================
 
-// ================================ Channel ======================================
+// ================================ 核心事件驱动层 ======================================
 // 这里只是简单测试，后续要换成EventLoop
 class Poller;
 class EventLoop;
@@ -384,11 +429,11 @@ private:
     // 这里只是简单测试，后续要换成EventLoop
     Poller* _poller;
     EventLoop* _loop;
-    uint32_t _events;       // 当前要监控的事件
-    uint32_t _revents;      // 当前连接触发的事件
+    uint32_t _events;       // 用户期望的，当前要监控的事件
+    uint32_t _revents;      // 返回给用户知道的，当前连接触发的事件
     using EventCallback = std::function<void()>;
 
-    // 五个回调函数
+    // 五个回调函数，把具体的业务逻辑通过std::function挂到底层组件上，实现解耦
     EventCallback _readCallback;        // 可读事件触发的回调
     EventCallback _writeCallback;       // 可写事件触发的回调
     EventCallback _closeCallback;       // 连接断开事件触发的回调
@@ -431,7 +476,9 @@ public:
     void Update();
 
     // 事件处理，一旦连接触发了事件，就调用这个函数，自己触发了什么事件，如何处理，由回调函数决定
+    // 多路转接的出口，当Epoll返回时，直接调用这个函数，根据_revents决定执行什么
     void handleEvent() {
+        // EPOLLIN: 可读 | EPOLLHUP: 对端关闭但还有数据没读完 | EPOLLPRI: 带外数据
         if((_revents & EPOLLIN) || (_revents & EPOLLHUP) || (_revents & EPOLLPRI)) {
             // 不管任何事件，只要有数据到来，就调用可读回调
             if(_readCallback) _readCallback();
@@ -456,15 +503,12 @@ public:
     }
 };
 
-// ===============================================================================
-
-// ================================ Poller =======================================
 #define MAX_EPOLLEVENTS 1024
 class Poller {
 private:
-    int _epfd;
-    struct epoll_event _events[MAX_EPOLLEVENTS];        // 事件数组
-    std::unordered_map<int, Channel*> _channels;        // 所有监控的连接
+    int _epfd;                                          // 红黑树根节点
+    struct epoll_event _events[MAX_EPOLLEVENTS];        // 事件数组，接收内核吐出的活跃事件数组
+    std::unordered_map<int, Channel*> _channels;        // 所有监控的连接，快速通过fd找到对应的Channel中介
 
 private:
     // 对epoll直接操作
@@ -518,7 +562,7 @@ public:
     }
     
     // 开始监控，返回活跃连接
-    // 输出型参数
+    // 服务器的心脏
     void Poll(std::vector<Channel*>* active) {
         // int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
         // -1表示一直等待，0表示立即返回，其他表示等待超时时间
@@ -533,16 +577,13 @@ public:
             // _events[i].data.fd 就是活跃连接的fd
             auto it = _channels.find(_events[i].data.fd);
             assert(it != _channels.end());
-            it->second->setRevents(_events[i].events);   // 设置实际就绪的事件
-            active->push_back(it->second);
+            it->second->setRevents(_events[i].events);   // 把实际发生的事件记录在Channel里
+            active->push_back(it->second);               // 放进活跃篮子里交给管家处理
         }
     }
 
 };
 
-// ===============================================================================
-
-// ================================ Timer =======================================
 class EventLoop;
 using taskFunc = std::function<void()>;
 using realseFunc = std::function<void()>;
@@ -580,7 +621,7 @@ private:
 
     EventLoop* _loop;
     int _timerFd;               // 定时器fd，可读事件回调时，从这里获取到超时事件
-    std::unique_ptr<Channel> _timerChannel;
+    std::unique_ptr<Channel> _timerChannel; // 定时器也需要专属管家
 
 private:
     void removeTimer(uint64_t id) {
@@ -629,6 +670,7 @@ private:
     }
 
     void onTimer() {
+        // 必须把timerfd里的8字节超时次数读走，否则epoll_wait会无限被电平触发，瞬间爆占CPU
         int times = readTimerFd();
         for(int i = 0; i < times; ++i) {
             runTimerTask();
@@ -674,10 +716,7 @@ public:
     void timerCancel(uint64_t id);
     bool isInTimer(uint64_t id) { return _timers.find(id) != _timers.end(); }
 };
-// ===============================================================================
 
-
-// ================================ EventLoop ================================================
 class EventLoop {
 private:
     using Functor = std::function<void()>;
@@ -685,7 +724,7 @@ private:
     int _eventFd;                             // 用于跨线程唤醒epoll_wait的eventfd
     std::unique_ptr<Channel> _eventChannel;   // 包装eventFd的通道，让它也能像网络连接一样被epoll监听
     Poller _poller;                           // 负责底层epoll的循环
-    std::vector<Functor> _tasks;              // 任务池
+    std::vector<Functor> _tasks;              // 任务池，是个临界区，每个线程都能进来领任务
     std::mutex _mutex;                        // 保证_tasks这个跨线程共享资源不被竞争破坏
     TimerWheel _timer_wheel;                  //定时器模块
 
@@ -777,8 +816,8 @@ public:
 
     // 让代码一定在EventLoop所在的线程中执行
     void runInLoop(const Functor& cb) {
-        if(isInLoop()) cb();
-        else queueInLoop(cb);
+        if(isInLoop()) cb();        // 自己人，不用排队，立刻执行
+        else queueInLoop(cb);       // 跨线程，进队列排队并敲门唤醒
     }
 
     // 压入任务到任务池
@@ -802,9 +841,7 @@ public:
     bool isInTimer(uint64_t id) { return _timer_wheel.isInTimer(id); }
     
 };
-// ===========================================================================================================
 
-// ================================ LoopThread LoopThreadPool ================================================
 class LoopThread{
 private:
     // 实现_loop获取的同步关系，避免线程创建了，但是_loop还没有实例化的情况
@@ -841,7 +878,6 @@ public:
         return loop;
     }
 };
-
 class LoopThreadPool{
 private:
     // 管理从属线程的创建和销毁，分配连接到线程上
@@ -871,60 +907,8 @@ public:
     }
 };
 
-// ===========================================================================================================
 
-// ========================================== Any ================================================
-class Any {
-private:
-    class holder {
-    public:
-        virtual ~holder() {}
-        virtual const std::type_info& type() const = 0;
-        virtual holder* clone() = 0;
-    };
-    template <class T>
-    class placeHolder : public holder {
-    public:
-        T _val;
-        placeHolder(const T& val) : _val(val) {}
-        virtual const std::type_info& type() const { return typeid(T); }
-        virtual holder* clone() { return new placeHolder(_val); }
-    };
 
-    holder* _content;
-public:
-    Any() :_content(nullptr) {}
-    template <class T>
-    Any(const T& val) :_content(new placeHolder<T>(val)) {}
-    Any(const Any& other) :_content(other._content? other._content->clone() : nullptr) {}
-    ~Any() { delete _content; }
-
-    Any& swap(Any& other) {
-        std::swap(_content, other._content);
-        return *this;
-    }
-
-    // 返回子类对象保存的数据的指针
-    template <class T>
-    T* getPtr() {
-        // 类型检查
-        assert(typeid(T) == _content->type());
-        // 先强转成placeHolder<T>指针，再取值，最后取地址
-        return &((placeHolder<T>*)_content)->_val;
-    }
-
-    template <class T>
-    Any& operator=(const T& val) {
-        //为val构造一个临时的通用容器，然后与当前容器自身进行指针交换，临时对象释放的时候，原先保存的数据也就被释放
-        Any(val).swap(*this);
-        return *this;
-    }
-
-    Any& operator=(const Any& other) {
-        Any(other).swap(*this);
-        return *this;
-    }
-};
 
 // ===========================================================================================================
 
