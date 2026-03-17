@@ -1,10 +1,10 @@
-#include "../server.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <regex>
 #include <sys/stat.h>
+#include "../server.hpp"
 
 #define DEFALT_TIMEOUT 10
 
@@ -146,98 +146,96 @@ std::unordered_map<std::string, std::string> _mime_msg = {
     {".7z",         "application/x-7z-compressed"}
 };
 
-
 class Util {
 public:
-    // 分割字符串
+    // 字符串分割
+    // 解析头部时，按照"\r\n"切割每一行，或按照"&"切割请求参数
     static size_t Split(const std::string& src, const std::string& sep, std::vector<std::string>* arr) {
         size_t offset = 0;
         while(offset < src.size()) {
             size_t pos = src.find(sep, offset);
-            // 走到末尾找不到的情况，整个字符串作为子串返回
             if(pos == std::string::npos) {
-                if(offset < src.size()) {   // 只要offset没越界，把最后的部分也要塞进去
-                    arr->push_back(src.substr(offset));
-                }
-                break;
+                if(pos == src.size()) break;
+                arr->push_back(src.substr(offset));
+                return arr->size();
             }
-
-            // 遇到连续的分割符sep，要跳过sep
             if(pos == offset) {
                 offset = pos + sep.size();
                 continue;
             }
-
-            // 正常的分割符sep，把子串塞进去
+            
             arr->push_back(src.substr(offset, pos - offset));
             offset = pos + sep.size();
         }
         return arr->size();
     }
-     
-    //读取文件的所有内容，将读取的内容放到一个Buffer中
-    static bool readFile(const std::string& filename, std::string* buf) {
-        std::ifstream ifs(filename, std::ios::binary);
-        if(ifs.is_open() == false) {
-            printf("OPEN %s FILE FAILED!!", filename.c_str());
-            return false;
-        }
 
-        size_t fsize = 0;
-        ifs.seekg(0, std::ios::end);    // 跳转读写位置到末尾
-        fsize = ifs.tellg();            //获取当前读写位置相对于起始位置的偏移量，从末尾偏移刚好就是文件大小
-        ifs.seekg(0, ifs.beg);          //跳转到起始位置
-        buf->resize(fsize);             //开辟文件大小的空间
+    // 读取文件到内存
+    static bool readFile(const std::string &filename, std::string *buf) {
+        std::ifstream ifs(filename, std::ios::binary);
+        if (ifs.is_open() == false) return false;
+        
+        ifs.seekg(0, ifs.end);
+        size_t fsize = ifs.tellg();  
+        ifs.seekg(0, ifs.beg);
+        
+        buf->resize(fsize); 
         ifs.read(&(*buf)[0], fsize);
-        if (ifs.good() == false) {
-            printf("READ %s FILE FAILED!!", filename.c_str());
-            ifs.close();
-            return false;
-        }
+        bool good = ifs.good();
         ifs.close();
-        return true;
+        return good;
     }
 
-    //向文件写入数据
+    // 写入文件
     static bool writeFile(const std::string &filename, const std::string &buf) {
         std::ofstream ofs(filename, std::ios::binary | std::ios::trunc);
-        if (ofs.is_open() == false) {
-            printf("OPEN %s FILE FAILED!!", filename.c_str());
-            return false;
-        }
+        if (ofs.is_open() == false) return false;
         ofs.write(buf.c_str(), buf.size());
-        if (ofs.good() == false) {
-            ERR_LOG("WRITE %s FILE FAILED!", filename.c_str());
-            ofs.close();    
-            return false;
-        }
+        bool good = ofs.good();
         ofs.close();
-        return true;
+        return good;
     }
 
-    // URL编码格式：将特殊字符的ASCII值转换成两个16进制字符，前缀%      C++ -> C%2B%2B
-    // 不编码的字符：. - _ ~ 字母，数字属于绝对不编码字符
-    // 查询字符串中的空格，需要编码为+，解码就是+转成空格
-    static char HEX2I(char c) {
-        if(c >= '0' && c <= '9') return c - '0';
-        // 这里很容易错！编码格式是%HH，有两位！
-        if(c >= 'A' && c <= 'Z') return c - 'A' + 10;
-        if(c >= 'a' && c <= 'z') return c - 'a' + 10;
-        return -1;
-    }
-
-    static std::string urlDecode(const std::string url, bool convertPlus2Space) {
+    // URL编码
+    // 保留字母数字和 . - _ ~，把空格转成 '+' (查询参数中)，其他的转成 "%HH" 格式
+    static std::string urlEncode(const std::string url, bool convert_space_to_plus) {
         std::string res;
-        for(int i = 0; i < url.size(); i++) {
-            if(url[i] == '+' && convertPlus2Space == true) {
+        for (auto &c : url) {
+            if (c == '.' || c == '-' || c == '_' || c == '~' || isalnum(c)) {
+                res += c;
+                continue;
+            }
+            if (c == ' ' && convert_space_to_plus == true) {
+                res += '+';
+                continue;
+            }
+            char tmp[4] = {0};
+            snprintf(tmp, 4, "%%%02X", c); // 格式化为 % 加上两位的十六进制大写字母
+            res += tmp;
+        }
+        return res;
+    }
+
+    // URL解码
+    static char HEXTOI(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        else if (c >= 'a' && c <= 'z') return c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+        return -1; 
+    }
+    // 把浏览器发来的 "%2B" 还原成真正的 "+"
+    static std::string urlDecode(const std::string url, bool convert_plus_to_space) {
+        std::string res;
+        for (int i = 0; i < url.size(); i++) {
+            // 历史遗留问题：查询字符串里的 + 号往往代表空格，需还原
+            if (url[i] == '+' && convert_plus_to_space == true) {
                 res += ' ';
                 continue;
             }
-            // 解析百分号编码：遇到%，就吃掉它和它后面的两个字符
-            if(url[i] == '%' && (i + 2) < url.size()) {
-                char v1 = HEX2I(url[i+1]);
-                char v2 = HEX2I(url[i+2]);
-                // 位运算还原：16进制高位 * 16 + 十六进制低位
+            // 遇到 % 就把后面两个字符按照十六进制计算还原
+            if (url[i] == '%' && (i + 2) < url.size()) {
+                char v1 = HEXTOI(url[i + 1]);
+                char v2 = HEXTOI(url[i + 2]);
                 char v = v1 * 16 + v2;
                 res += v;
                 i += 2;
@@ -248,8 +246,42 @@ public:
         return res;
     }
 
-    // 路径合法性校验
-    // 请求 GET /../../etc/passwd HTTP/1.1
+    // 查状态码字典
+    static std::string statuDesc(int statu) {
+        auto it = _statu_msg.find(statu);
+        if (it != _statu_msg.end()) return it->second;
+        return "Unknow";
+    }
+
+    // 根据文件后缀名获取 MIME 类型
+    static std::string extMime(const std::string &filename) {
+        size_t pos = filename.find_last_of('.');
+        if (pos == std::string::npos) return "application/octet-stream";
+        
+        std::string ext = filename.substr(pos);
+        auto it = _mime_msg.find(ext);
+        if (it == _mime_msg.end()) return "application/octet-stream";
+        
+        return it->second;
+    }
+
+    // 文件系统判断
+    static bool isDirectory(const std::string &filename) {
+        struct stat st;
+        int ret = stat(filename.c_str(), &st);
+        if (ret < 0) return false;
+        return S_ISDIR(st.st_mode);
+    }
+    static bool isRegular(const std::string &filename) {
+        struct stat st;
+        int ret = stat(filename.c_str(), &st);
+        if (ret < 0) return false;
+        return S_ISREG(st.st_mode);
+    }
+
+    // 防御目录穿越攻击
+    // 防止用户发送类似 GET /../../../etc/passwd HTTP/1.1 这样的请求
+    // 计算目录深度，进一层+1，只要深度小于0，说明企图跳出根目录，直接拦死
     static bool validPath(const std::string& path) {
         std::vector<std::string> subdir;
         Split(path, "/", &subdir);
@@ -257,138 +289,89 @@ public:
         for(auto& dir : subdir) {
             if(dir == "..") {
                 level--;
-                // 哪怕进去了10层，只要退到-1层，就是越界
                 if(level < 0) return false;
-                continue;   // 继续检查是否回退
+                continue;
             }
             level++;
         }
         return true;
     }
-
-    // 获取响应状态码描述信息
-    static std::string statuDesc(int statu) {
-        auto it = _statu_msg.find(statu);
-        if(it != _statu_msg.end()) return it->second;
-        return "Unknown";
-    }
-
-    // 根据文件后缀名获取文件mime
-    static std::string extMime(const std::string& filename) {
-        // a.x.txt 先获取文件扩展名
-        size_t pos = filename.find_last_of('.');
-        if(pos == std::string::npos) return "application/octet-stream";
-
-        // 根据文件扩展名，获取mime类型
-        std::string ext = filename.substr(pos);
-        auto it = _mime_msg.find(ext);
-        if(it ==  _mime_msg.end()) return "application/octet-stream";
-        return it->second;
-    }
-
-    // 判断一个文件是否为目录
-    static bool isDirectory(const std::string& filename) {
-        struct stat st;
-        int ret = stat(filename.c_str(), &st);
-        if(ret < 0) return false;
-        return S_ISDIR(st.st_mode);
-    }
-
-    // 判断一个文件是否为普通文件
-    static bool isRegularFile(const std::string& filename) {
-        struct stat st;
-        int ret = stat(filename.c_str(), &st);
-        if(ret < 0) return false;
-        return S_ISREG(st.st_mode);
-    }
 };
 
-class HttpRequest {
+class HttpRequest{
 public:
     std::string _method;        // 请求方法
-    std::string _path;          // 请求路径
-    std::string _version;       // HTTP版本
+    std::string _path;          // 请求资源路径
+    std::string _version;       // HTTP 版本
     std::string _body;          // 请求正文
-    std::smatch _matches;       // 正则匹配结果
-    std::unordered_map<std::string, std::string> _headers;  // 头部字段
-    std::unordered_map<std::string, std::string> _params;   // 查询字符串
-
+    std::smatch _match;         // 资源路径正则匹配结果
+    // 头部字段用哈希表存放，如果用字符串那么就糅杂在一起，还需要进一步分割
+    std::unordered_map<std::string, std::string> _headers; // 请求头
+    std::unordered_map<std::string, std::string> _params;  // 请求参数
 public:
     HttpRequest() :_version("HTTP/1.1") {}
-
     void reSet() {
         _method.clear();
         _path.clear();
         _version = "HTTP/1.1";
         _body.clear();
-        std::smatch match;
-        _matches.swap(match);
+        std::smatch().swap(_match);
         _headers.clear();
         _params.clear();
     }
 
-    // 插入头部字段
-    void setHeader(const std::string& key, const std::string& value) {
-        _headers.insert(std::make_pair(key, value));
-    }
-
-    // 判断是否存在指定头部字段
-    bool hasHeader(const std::string& key) const {
-        auto it = _headers.find(key);
-        if(it == _headers.end()) return false;
-        return true;
-    }
-
-    // 获取指定头部字段的值
+    // 获头部字段
     std::string getHeader(const std::string& key) const {
         auto it = _headers.find(key);
         if(it == _headers.end()) return "";
         return it->second;
     }
 
-    // 插入查询字符串
-    void setParam(const std::string& key, const std::string& value) {
-        _params.insert(std::make_pair(key, value));
-    }
-
-    // 判断是否存在指定查询字符串
-    bool hasParam(const std::string& key) const {
-        auto it = _params.find(key);
-        if(it == _params.end()) return false;
-        return true;
-    }
-
-    // 获取指定的查询字符串
+    // 获请求参数
     std::string getParam(const std::string& key) const {
         auto it = _params.find(key);
-        if(it == _params.end()) return "";  
+        if(it == _params.end()) return "";
         return it->second;
     }
 
     // 获取正文长度
-    size_t contentLength() const {
+    size_t getContentLength() const {
         bool ret = hasHeader("Content-Length");
         if(ret == false) return 0;
-        return std::stoul(getHeader("Content-Length"));
+        std::string clen = getHeader("Content-Length");
+        return std::stol(clen);
     }
-    
-    // 判断是否短连接
-    bool Close() const {
-        // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
+
+    // 判断是否长连接
+    bool isKeepAlive() const {
+        // 没有Connection字段，或者有这个字段但是值是close是短连接
         if(hasHeader("Connection") == true && getHeader("Connection") == "keep-alive")
-            return false;
+            return true;
+        return false;
+    }
+
+    // 判断头部字段是否有指定值
+    bool hasHeader(const std::string& key) const {
+        auto it = _headers.find(key);
+        if(it == _headers.end()) return false;
         return true;
+    }
+
+    void setHeader(const std::string& key, const std::string& value) {
+        _headers[key] = value;
+    }
+    void setParam(const std::string& key, const std::string& value) {
+        _params[key] = value;
     }
 };
 
-class HttpResponse {
+class HttpResponse{
 public:
-    int _statu;                // 响应状态码
-    std::string _body;         // 响应正文
+    int _statu;                // 状态码
     bool _redirect_flag;       // 是否重定向
-    std::string _redirect_url; // 重定向URL
-    std::unordered_map<std::string, std::string> _headers;  // 头部字段
-
+    std::string _redirect_url; // 重定向地址
+    std::string _body;         // 响应正文
+    std::unordered_map<std::string, std::string> _headers; // 响应头
 public:
     HttpResponse() :_statu(200), _redirect_flag(false) {}
     HttpResponse(int statu) :_statu(statu), _redirect_flag(false) {}
@@ -396,231 +379,447 @@ public:
     void reSet() {
         _statu = 200;
         _redirect_flag = false;
-        _body.clear();
         _redirect_url.clear();
+        _body.clear();
         _headers.clear();
+    }
+
+    // 获取头部字段指定值
+    std::string getHeader(const std::string& key) const {
+        auto it = _headers.find(key);
+        if(it == _headers.end()) return "";
+        return it->second;
     }
 
     // 插入头部字段
     void setHeader(const std::string& key, const std::string& value) {
-        _headers.insert(std::make_pair(key, value));
+        _headers[key] = value;
     }
 
-    // 判断是否存在指定头部字段
+    // 判断头部字段是否有指定值
     bool hasHeader(const std::string& key) const {
         auto it = _headers.find(key);
         if(it == _headers.end()) return false;
         return true;
     }
 
-    // 获取指定头部字段的值
-    std::string getHeader(const std::string& key) const {
-        auto it = _headers.find(key);
-        if(it == _headers.end()) return "";
-        return it->second;
-    }
- 
-    // 设置响应正文
-    void setContentType(const std::string& body, const std::string& type = "text/html") {
+    // 设置正文
+    void setBody(const std::string& body, const std::string& type = "text/html") {
         _body = body;
         setHeader("Content-Type", type);
     }
 
     // 设置重定向
     void setRedirect(const std::string& url, int statu = 302) {
-        _statu = statu;
         _redirect_flag = true;
         _redirect_url = url;
+        _statu = statu;
     }
 
-    // 判断是否短连接
-    bool Close() const {
-        // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
+    // 判断是否长连接
+    bool isKeepAlive() const {
+        // 没有Connection字段，或者有这个字段但是值是close是短连接
         if(hasHeader("Connection") == true && getHeader("Connection") == "keep-alive")
-            return false;   
-        return true;
+            return true;
+        return false;
     }
-
 };
 
 
 typedef enum {
-    RECV_HTTP_ERROR,
-    RECV_HTTP_LINE,             // 1. 解析HTTP请求行
-    RECV_HTTP_HEAD,             // 2. 解析HTTP头部
-    RECV_HTTP_BODY,             // 3. 解析HTTP正文
-    RECV_HTTP_DONE
-}HttpRecvStatu;
-#define MAX_HTTP_LINE_SIZE 8192
+    RECV_HTTP_ERROR,      // 接收 HTTP 错误
+    RECV_HTTP_LINE,       // 在请求行
+    RECV_HTTP_HEAD,       // 在请求头
+    RECV_HTTP_BODY,       // 在请求正文
+    RECV_HTTP_DONE        // 解析出HttpRequest对象
+} HttpRecvStatu;
+
+#define MAX_LINE 8192
+
 class HttpContext {
 private:
     int _resp_statu;             // 响应状态码
     HttpRecvStatu _recv_statu;   // 接收状态
-    HttpRequest _request;        // 已经解析得到的请求信息   
+    HttpRequest _request;        // 解析得到的HttpRequest对象
 
 private:
-    bool parseHttpLine(const std::string& line) {
+    // 解析请求行
+     bool parseHttpLine(const std::string &line) {
         std::smatch matches;
         std::regex e("(GET|HEAD|POST|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP/1\\.[01])(?:\n|\r\n)?", std::regex::icase);
         bool ret = std::regex_match(line, matches, e);
-        if(ret == false) {
+        if (ret == false) {
             _recv_statu = RECV_HTTP_ERROR;
-            _resp_statu = 400;
+            _resp_statu = 400;//BAD REQUEST
             return false;
         }
-        
-        // 获取请求方法
+        //请求方法的获取
         _request._method = matches[1];
         std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
-        // 获取请求路径，对URL解码，但是不用+转空格
+        //资源路径的获取，需要进行URL解码操作，但是不需要+转空格
         _request._path = Util::urlDecode(matches[2], false);
-        // 获取协议版本
+        //协议版本的获取
         _request._version = matches[4];
-
-        // 获取并处理查询字符串
-        std::vector<std::string> query_string_arr;
+        //查询字符串的获取与处理
+        std::vector<std::string> query_string_arry;
         std::string query_string = matches[3];
-        // key=value&key=value..... 先以&进行分割，得到各个子串
-        Util::Split(query_string, "&", &query_string_arr);
-        // 针对各个字串，以=进行分割，得到key和value，得到之后进行URL解码
-        for(auto& str : query_string_arr) {
+        //查询字符串的格式 key=val&key=val....., 先以 & 符号进行分割，得到各个字串
+        Util::Split(query_string, "&", &query_string_arry);
+        //针对各个字串，以 = 符号进行分割，得到key 和val， 得到之后也需要进行URL解码
+        for (auto &str : query_string_arry) {
             size_t pos = str.find("=");
-            if(pos == std::string::npos) {
+            if (pos == std::string::npos) {
                 _recv_statu = RECV_HTTP_ERROR;
-                _resp_statu = 400;
+                _resp_statu = 400;//BAD REQUEST
                 return false;
             }
-            std::string key = Util::urlDecode(str.substr(0, pos), false);
-            std::string value = Util::urlDecode(str.substr(pos+1), false);
-            _request.setParam(key, value);
+            std::string key = Util::urlDecode(str.substr(0, pos), true);  
+            std::string val = Util::urlDecode(str.substr(pos + 1), true);
+            _request.setParam(key, val);
         }
         return true;
     }
 
-    // 接收并解析http请求行
-    // "GET /login HTTP/1.1\r\n"
+    // 获取请求行
     bool recvHttpLine(Buffer* buf) {
         if(_recv_statu != RECV_HTTP_LINE) return false;
-        // 从Buffer里找\r\n
+
+        // 1. 尝试从缓冲区拿出一行数据
         std::string line = buf->readLineAndMove();
 
-        // 如果没读到换行符，说明没收到完整的包，这行命令没收全！
         if(0 == line.size()) {
-            // 如果发了8KB数据还没有换行符，肯定是恶意攻击，直接拉黑
-            if(buf->getReadableSize() > MAX_HTTP_LINE_SIZE) {
+            // 情况一：没拿到换行符，且当前缓冲区里的数据已经超过规定的最大长度
+            // 说明请求行太长了，直接返回错误
+            if(buf->getReadableSize() > MAX_LINE) {
                 _recv_statu = RECV_HTTP_ERROR;
-                _resp_statu = 400;
+                _resp_statu = 414; // URI Too Long
                 return false;
             }
-            // 半包处理，返回true
-            // 意思是解析先告一段落，等下次epoll提示可读了，我再进来找\r\n
+            // 情况二：数据不够一行，但是长度在安全范围内，半包
+            // 说明还没收到完整的请求行，继续等待
             return true;
         }
+        // 情况三：拿到了一行，但是这一行超过了安全阈值，粘包
+        if(line.size() > MAX_LINE) {
+            _recv_statu = RECV_HTTP_ERROR;
+            _resp_statu = 400; // Bad Request
+            return false;
+        }
+        
+        // 完美数据，交给正则函数去提取方法、路径、版本
+        bool ret = parseHttpLine(line);
+        if(ret == false) return false;
 
-        if(line.size() > MAX_HTTP_LINE_SIZE) return false;
-
-        // 提取请求方法、路径、版本
-        if(parseHttpLine(line) == false) return false;
-
-        // 解析完请求行，进入头部解析
+        // 成功解析出请求行，进入头部解析
         _recv_statu = RECV_HTTP_HEAD;
         return true;
     }
 
-    // 解析http请求头
-    // "Content-Length: 1234"
-    bool parseHttpHead(std::string& line) {
-        if(line.back() == '\n') line.pop_back();
-        if(line.back() == '\r') line.pop_back();
-        
-        // key: value
+    // 解析请求头
+     bool parseHttpHead(std::string &line) {
+        //key: val\r\nkey: val\r\n....
+        if (line.back() == '\n') line.pop_back();//末尾是换行则去掉换行字符
+        if (line.back() == '\r') line.pop_back();//末尾是回车则去掉回车字符
         size_t pos = line.find(": ");
-        if(pos == std::string::npos) {
+        if (pos == std::string::npos) {
             _recv_statu = RECV_HTTP_ERROR;
-            _resp_statu = 400;
+            _resp_statu = 400;//
             return false;
         }
-        // 拿冒号前的key
-        std::string key = line.substr(0, pos);
-        // 跳过冒号和空格，拿value
-        std::string value = line.substr(pos+2);
-        _request.setHeader(key, value);
+        std::string key = line.substr(0, pos);  
+        std::string val = line.substr(pos + 2);
+        _request.setHeader(key, val);
         return true;
     }
 
-    // 接收所有请求头部字段
+    // 获取请求头 key: value\r\n
     bool recvHttpHead(Buffer* buf) {
         if(_recv_statu != RECV_HTTP_HEAD) return false;
 
         while(1) {
             std::string line = buf->readLineAndMove();
-            // 处理半包
+
             if(0 == line.size()) {
-                if(buf->getReadableSize() > MAX_HTTP_LINE_SIZE) return false;
+                // 情况一：没拿到换行符，且当前缓冲区里的数据已经超过规定的最大长度
+                if(buf->getReadableSize() > MAX_LINE) {
+                    _recv_statu = RECV_HTTP_ERROR;
+                    _resp_statu = 414; // URI Too Long
+                    return false;
+                }
+                // 情况二：数据不够一行，但是长度在安全范围内，半包
+                // 说明还没收到完整的请求头，继续等待
                 return true;
             }
+            
+            // 情况三：拿到了一行，但是这一行超过了安全阈值，粘包
+            if(line.size() > MAX_LINE) {
+                _recv_statu = RECV_HTTP_ERROR;
+                _resp_statu = 400; // Bad Request
+                return false;
+            }
 
-            // 空行代表头部字段结束
+            // 遇到了换行符，说明头部结束了，进入正文解析
             if(line == "\n" || line == "\r\n") break;
 
-            if(parseHttpHead(line) == false) return false;
+            bool ret = parseHttpHead(line);
+            if(ret == false) return false;
         }
+        // 进入正文获取阶段
         _recv_statu = RECV_HTTP_BODY;
         return true;
     }
-    
-    // 接收请求正文
+
+    // 获取请求正文
     bool recvHttpBody(Buffer* buf) {
         if(_recv_statu != RECV_HTTP_BODY) return false;
-        
-        size_t content_length = _request.contentLength();
+        // 获取正文长度
+        size_t content_length = _request.getContentLength();
         if(0 == content_length) {
-            // 没有正文
+            // 没有正文，直接进入完成状态
             _recv_statu = RECV_HTTP_DONE;
             return true;
         }
 
-        // 计算正文长度
-        size_t real_len = content_length - _request._body.size();
-        
-        // 粘包了怎么办
-        // 我需要100字节，buffer里有150字节
+        // 获取实际要接收的长度
+        // 总长100，当前_request._body里已经装了20，还需要80
+        size_t real_len = content_length - _request._body.size(); // 实际要接收的
+
+        // 接收正文放到body里，需要考虑当前缓冲区的数据，是否全部的正文
         if(buf->getReadableSize() >= real_len) {
-            // 只拿100，剩下的50留着
             _request._body.append(buf->getReadIndex(), real_len);
             buf->moveReadOffset(real_len);
             _recv_statu = RECV_HTTP_DONE;
             return true;
         }
 
-        // 半包了怎么办
-        // 要100字节，buffer里只有50字节
-        // 拿完50字节，状态保持不变，返回true等待下次epoll唤醒！
+        // 缓冲区里没有足够的数据，取出当前数据，等待新数据
         _request._body.append(buf->getReadIndex(), buf->getReadableSize());
         buf->moveReadOffset(buf->getReadableSize());
         return true;
     }
 
+    
+
 public:
     HttpContext() :_resp_statu(200), _recv_statu(RECV_HTTP_LINE) {}
+
+    // 每次处理完一个请求，必须重置，要复用这个连接处理其它请求
     void reSet() {
         _resp_statu = 200;
         _recv_statu = RECV_HTTP_LINE;
         _request.reSet();
     }
+    
+    // 获取状态码
+    int getRespStatu() const {
+        return _resp_statu;
+    }
+    // 获取接收状态信息
+    HttpRecvStatu getRecvStatu() const {
+        return _recv_statu;
+    }
+    // 获取请求对象
+    HttpRequest& getRequest() {
+        return _request;
+    }
 
-    int getRespStatu() const { return _resp_statu; }
-    HttpRecvStatu getRecvStatu() const { return _recv_statu; }
-    const HttpRequest& getRequest() const { return _request; }
-
-    // 接收http请求并解析
+    // 接收并解析HTTP请求
     void recvHttpRequest(Buffer* buf) {
-        // 不同的状态做不同的事情，一定不能break
-        // 处理完请求行之后，接着处理请求头，然后处理请求正文
+        // 不同的状态，做不同的事情
+        // 但是一定不能break！处理完请求行，接着处理请求头！
         switch(_recv_statu) {
-            case RECV_HTTP_LINE: recvHttpLine(buf); 
+            case RECV_HTTP_LINE: recvHttpLine(buf);
             case RECV_HTTP_HEAD: recvHttpHead(buf);
             case RECV_HTTP_BODY: recvHttpBody(buf);
         }
+    }
+};
+
+
+class HttpServer {
+private:
+    using Handler = std::function<void(const HttpRequest&, HttpResponse*)>;
+    using Handlers = std::vector<std::pair<std::regex, Handler>>;
+
+    Handlers _get_route;
+    Handlers _post_route;
+    Handlers _put_route;
+    Handlers _delete_route;
+    std::string _basedir;       // 静态资源根目录
+    TcpServer _server;          // TCP服务器
+
+private:
+    // 组装一个简单的 4xx/5xx HTML 报错页面
+    void errorHandler(const HttpRequest &req, HttpResponse *rsp) {
+        std::string body = "<html><body><h1>" + std::to_string(rsp->_statu) + 
+                           " " + Util::statuDesc(rsp->_statu) + "</h1></body></html>";
+        rsp->setBody("body", "text/html");
+    }
+
+    // 把 HttpResponse 对象，重新变成 HTTP 字符串发给网卡
+    void writeReponse(const ptrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
+        // 完善头部：长短连接、正文长度、数据类型
+        if (req.isKeepAlive() == false) rsp.setHeader("Connection", "close");
+        else rsp.setHeader("Connection", "keep-alive");
+        
+        if (!rsp._body.empty() && !rsp.hasHeader("Content-Length"))
+            rsp.setHeader("Content-Length", std::to_string(rsp._body.size()));
+        if (!rsp._body.empty() && !rsp.hasHeader("Content-Type"))
+            rsp.setHeader("Content-Type", "application/octet-stream");
+        if (rsp._redirect_flag)
+            rsp.setHeader("Location", rsp._redirect_url);
+
+        // 严格按照 HTTP 报文格式拼接：状态行 -> 头部 -> 空行 -> 正文
+        std::stringstream rsp_str;
+        rsp_str << req._version << " " << rsp._statu << " " << Util::statuDesc(rsp._statu) << "\r\n";
+        for (auto &head : rsp._headers) {
+            rsp_str << head.first << ": " << head.second << "\r\n";
+        }
+        rsp_str << "\r\n" << rsp._body;
+
+        // 调用底层 TCP 接口发送数据
+        conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
+    }
+
+    // 静态资源处理,去硬盘里读文件
+    void fileHandler(const HttpRequest &req, HttpResponse *rsp) {
+        std::string req_path = _basedir + req._path;
+        if (req._path.back() == '/') req_path += "index.html"; // 默认主页
+        
+        bool ret = Util::readFile(req_path, &rsp->_body);
+        if (ret == false) {
+            rsp->_statu = 404;
+            return;
+        }
+        rsp->setHeader("Content-Type", Util::extMime(req_path));
+    }
+
+    // 正则分发器，遍历路由表，匹配就执行
+    void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers &handlers) {
+        for (auto &handler : handlers) {
+            const std::regex &re = handler.first;
+            const Handler &functor = handler.second;
+            if (std::regex_match(req._path, req._match, re)) {
+                return functor(req, rsp); // 匹配成功，执行业务代码！
+            }
+        }
+        rsp->_statu = 404; // 遍历完没找到，报 404
+    }
+
+    // 总控路由，决定是找静态文件，还是找动态接口
+    bool isFileHandler(const HttpRequest &req) {
+        // 1. 必须设置了静态资源根目录
+        if (_basedir.empty()) {
+            return false;
+        }
+        // 2. 请求方法，必须是GET / HEAD请求方法
+        if (req._method != "GET" && req._method != "HEAD") {
+            return false;
+        }
+        // 3. 请求的资源路径必须是一个合法路径
+        if (Util::validPath(req._path) == false) {
+            return false;
+        }
+        // 4. 请求的资源必须存在,且是一个普通文件
+        //    有一种请求比较特殊 -- 目录：/, /image/， 这种情况给后边默认追加一个 index.html
+        // index.html    /image/a.png
+        // 不要忘了前缀的相对根目录,也就是将请求路径转换为实际存在的路径  /image/a.png  ->   ./wwwroot/image/a.png
+        std::string req_path = _basedir + req._path;//为了避免直接修改请求的资源路径，因此定义一个临时对象
+        if (req._path.back() == '/')  {
+            req_path += "index.html";
+        }
+        if (Util::isRegular(req_path) == false) {
+            return false;
+        }
+        return true;
+    }
+    void Route(HttpRequest &req, HttpResponse *rsp) {
+        // IsFileHandler 是一个判断路径是不是请求文件的简单函数（比如看后缀，看基于 basedir 是否存在）
+        if (isFileHandler(req) == true) {
+            return fileHandler(req, rsp);
+        }
+        // 不是文件，那就去查对应的动态接口路由表
+        if (req._method == "GET" || req._method == "HEAD") return Dispatcher(req, rsp, _get_route);
+        else if (req._method == "POST") return Dispatcher(req, rsp, _post_route);
+        else if (req._method == "PUT") return Dispatcher(req, rsp, _put_route);
+        else if (req._method == "DELETE") return Dispatcher(req, rsp, _delete_route);
+        
+        rsp->_statu = 405; // Method Not Allowed
+    }
+
+    // 设置上下文，底层TCP刚建立连接时触发
+    void onConnected(const ptrConnection& conn) {
+        // 利用Any，给新连接绑定一个全新的HTTP状态
+        conn->setContext(HttpContext());
+    }
+
+    // 当TCP接收到数据时触发
+    void onMessage(const ptrConnection& conn, Buffer* buf) {
+        // 只要缓冲区里有4数据，就一直循环处理
+        while(buf->getReadableSize() > 0) {
+            HttpContext* context = conn->getContext()->getPtr<HttpContext>();
+            context->recvHttpRequest(buf);
+
+            HttpRequest& req = context->getRequest();
+            HttpResponse rsp(context->getRespStatu());
+
+            if(context->getRespStatu() >= 400) {
+                errorHandler(req, &rsp);                // 出错界面
+                writeReponse(conn, req, rsp);           // 发送报错页面
+                context->reSet();                       // 重置状态
+                buf->moveReadOffset(buf->getReadableSize()); // 跳过当前请求
+                conn->Shutdown();                       // 关闭连接
+            }
+
+            // 半包
+            if(context->getRecvStatu() != RECV_HTTP_DONE) {
+                return;
+            }
+
+            // 业务分发
+            Route(req, &rsp);
+
+            // 长连接重置
+            context->reSet();
+
+            if(rsp.isKeepAlive() == false) conn->Shutdown(); // 短连接关闭连接
+        }
+    }
+
+public:
+    HttpServer(int port, int timeout = DEFALT_TIMEOUT)
+        :_server(port) {
+        _server.setEnableInactiveRelease(timeout);
+        _server.setConnectedCallBack(std::bind(&HttpServer::onConnected, this, std::placeholders::_1));
+        _server.setMessageCallBack(std::bind(&HttpServer::onMessage, this, std::placeholders::_1, std::placeholders::_2));
+    }
+
+    void setBaseDir(const std::string& path) {
+        assert(Util::isDirectory(path) == true);
+        _basedir = path;
+    }
+
+    void Get(const std::string& pattern, const Handler& handler) {
+        _get_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    void Post(const std::string& pattern, const Handler& handler) {
+        _post_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    void Put(const std::string& pattern, const Handler& handler) {
+        _put_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    void Delete(const std::string& pattern, const Handler& handler) {
+        _delete_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    void setThreadCnt(int cnt) {
+        _server.setThreadCnt(cnt);
+    }
+
+    void Listen() {
+        _server.Loop();
     }
 };
