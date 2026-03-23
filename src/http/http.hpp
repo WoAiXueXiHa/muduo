@@ -653,7 +653,7 @@ private:
     void errorHandler(const HttpRequest &req, HttpResponse *rsp) {
         std::string body = "<html><body><h1>" + std::to_string(rsp->_statu) + 
                            " " + Util::statuDesc(rsp->_statu) + "</h1></body></html>";
-        rsp->setBody("body", "text/html");
+        rsp->setBody(body, "text/html");
     }
 
     // 把 HttpResponse 对象，重新变成 HTTP 字符串发给网卡
