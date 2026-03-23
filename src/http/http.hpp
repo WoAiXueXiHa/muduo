@@ -1,5 +1,7 @@
 #include <iostream>
 #include <fstream>
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <regex>
@@ -436,6 +438,36 @@ typedef enum {
 
 #define MAX_LINE 8192
 
+// #region agent_debug_log
+static void AgentDebugLog(const char* runId,
+                           const char* hypothesisId,
+                           const char* location,
+                           const std::string& message,
+                           const std::string& dataJson) {
+    const char* logPath = "/home/vect/muduo/.cursor/debug-56588c.log";
+    std::ofstream ofs(logPath, std::ios::app);
+    if (!ofs.is_open()) {
+        std::cerr << "[AgentDebugLog] open failed: " << logPath << std::endl;
+        return;
+    }
+
+    using namespace std::chrono;
+    auto ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    static std::atomic<unsigned long long> seq{0};
+    auto n = seq.fetch_add(1);
+
+    ofs << "{\"sessionId\":\"56588c\""
+        << ",\"id\":\"log_" << ts << "_" << n << "\""
+        << ",\"timestamp\":" << ts
+        << ",\"runId\":\"" << runId << "\""
+        << ",\"hypothesisId\":\"" << hypothesisId << "\""
+        << ",\"location\":\"" << location << "\""
+        << ",\"message\":\"" << message << "\""
+        << ",\"data\":" << dataJson
+        << "}\n";
+}
+// #endregion
+
 class HttpContext {
 private:
     int _resp_statu;             // 响应状态码
@@ -460,6 +492,13 @@ private:
         _request._path = Util::urlDecode(matches[2], false);
         //协议版本的获取
         _request._version = matches[4];
+        // #region agent_debug_log
+        AgentDebugLog("debug2", "H5", "http.hpp:parseHttpLine",
+                      std::string("parsed method=") + _request._method +
+                          " path=" + _request._path +
+                          " version=" + _request._version,
+                      "{}");
+        // #endregion
         //查询字符串的获取与处理
         std::vector<std::string> query_string_arry;
         std::string query_string = matches[3];
@@ -529,6 +568,17 @@ private:
         std::string key = line.substr(0, pos);  
         std::string val = line.substr(pos + 2);
         _request.setHeader(key, val);
+        // #region agent_debug_log
+        {
+            std::string lowerKey = key;
+            std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+            if (lowerKey == "content-length") {
+                AgentDebugLog("debug2", "H6", "http.hpp:parseHttpHead",
+                              std::string("Content-Length header key=[") + key + "] val=[" + val + "]",
+                              "{}");
+            }
+        }
+        // #endregion
         return true;
     }
 
@@ -559,7 +609,24 @@ private:
             }
 
             // 遇到了换行符，说明头部结束了，进入正文解析
-            if(line == "\n" || line == "\r\n") break;
+            if(line == "\n" || line == "\r\n") {
+                // #region agent_debug_log
+                AgentDebugLog("debug2", "H7", "http.hpp:recvHttpHead",
+                              "end of headers (blank line) -> switch to BODY",
+                              "{}");
+                // #endregion
+                // GET/HEAD 请求没有 body，避免等待下一次回调导致空响应
+                if (_request._method == "GET" || _request._method == "HEAD") {
+                    _recv_statu = RECV_HTTP_DONE;
+                    // #region agent_debug_log
+                    AgentDebugLog("debug2", "H8", "http.hpp:recvHttpHead",
+                                  "GET/HEAD no-body -> set RECV_HTTP_DONE",
+                                  "{}");
+                    // #endregion
+                    return true;
+                }
+                break;
+            }
 
             bool ret = parseHttpHead(line);
             if(ret == false) return false;
@@ -574,6 +641,13 @@ private:
         if(_recv_statu != RECV_HTTP_BODY) return false;
         // 获取正文长度
         size_t content_length = _request.getContentLength();
+        // #region agent_debug_log
+        AgentDebugLog("debug2", "H6", "http.hpp:recvHttpBody",
+                      std::string("enter BODY content_length=") + std::to_string(content_length) +
+                          " bodyAlready=" + std::to_string(_request._body.size()) +
+                          " readableNow=" + std::to_string(buf->getReadableSize()),
+                      "{}");
+        // #endregion
         if(0 == content_length) {
             // 没有正文，直接进入完成状态
             _recv_statu = RECV_HTTP_DONE;
@@ -626,14 +700,19 @@ public:
     // 接收并解析HTTP请求
     void recvHttpRequest(Buffer* buf) {
         // 不同的状态，做不同的事情
-        // 但是一定不能break！处理完请求行，接着处理请求头！
         switch(_recv_statu) {
-            case RECV_HTTP_LINE: recvHttpLine(buf);
-            case RECV_HTTP_HEAD: recvHttpHead(buf);
-            case RECV_HTTP_BODY: recvHttpBody(buf);
+            case RECV_HTTP_LINE: 
+                recvHttpLine(buf);
+                break;
+            case RECV_HTTP_HEAD: 
+                recvHttpHead(buf);
+                break;
+            case RECV_HTTP_BODY: 
+                recvHttpBody(buf);
+                break;
         }
     }
-};
+};  
 
 
 class HttpServer {
@@ -658,13 +737,16 @@ private:
 
     // 把 HttpResponse 对象，重新变成 HTTP 字符串发给网卡
     void writeReponse(const ptrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
+        AgentDebugLog("post-fix", "H1", "http.hpp:writeReponse",
+                       std::string("writeReponse called rsp_statu=") + std::to_string(rsp._statu),
+                       "{}");
         // 完善头部：长短连接、正文长度、数据类型
         if (req.isKeepAlive() == false) rsp.setHeader("Connection", "close");
         else rsp.setHeader("Connection", "keep-alive");
         
         if (!rsp._body.empty() && !rsp.hasHeader("Content-Length"))
             rsp.setHeader("Content-Length", std::to_string(rsp._body.size()));
-        if (!rsp._body.empty() && !rsp.hasHeader("Content-Type"))
+        if (!rsp.hasHeader("Content-Type"))
             rsp.setHeader("Content-Type", "application/octet-stream");
         if (rsp._redirect_flag)
             rsp.setHeader("Location", rsp._redirect_url);
@@ -758,12 +840,19 @@ private:
         // 只要缓冲区里有4数据，就一直循环处理
         while(buf->getReadableSize() > 0) {
             HttpContext* context = conn->getContext()->getPtr<HttpContext>();
+            AgentDebugLog("post-fix", "H0", "http.hpp:onMessage",
+                           std::string("onMessage enter readable=") + std::to_string(buf->getReadableSize()),
+                           "{}");
+            auto readableBefore = buf->getReadableSize();
             context->recvHttpRequest(buf);
 
             HttpRequest& req = context->getRequest();
             HttpResponse rsp(context->getRespStatu());
 
             if(context->getRespStatu() >= 400) {
+                AgentDebugLog("post-fix", "H3", "http.hpp:onMessage",
+                               std::string("early error from parse ctxResp=") + std::to_string(context->getRespStatu()),
+                               "{}");
                 errorHandler(req, &rsp);                // 出错界面
                 writeReponse(conn, req, rsp);           // 发送报错页面
                 context->reSet();                       // 重置状态
@@ -773,18 +862,28 @@ private:
 
             // 半包
             if(context->getRecvStatu() != RECV_HTTP_DONE) {
-                return;
+                AgentDebugLog("post-fix", "H4", "http.hpp:onMessage",
+                               std::string("not DONE yet recvStatu=") + std::to_string((int)context->getRecvStatu()) +
+                                   " contentLength=" + std::to_string(req.getContentLength()) +
+                                   " readableAfterParse=" + std::to_string(buf->getReadableSize()),
+                               "{}");
+                // 如果解析期间没有消耗任何可读数据，就等待下一次网络回调（半包）
+                if(buf->getReadableSize() == readableBefore) return;
+                // 否则说明当前缓冲区里已经有后续数据，可以继续解析下一阶段
+                continue;
             }
-
             // 业务分发
             Route(req, &rsp);
+
+            // 把响应真正发送给客户端
+            writeReponse(conn, req, rsp);
 
             // 长连接重置
             context->reSet();
 
             if(rsp.isKeepAlive() == false) conn->Shutdown(); // 短连接关闭连接
         }
-    }
+    }               
 
 public:
     HttpServer(int port, int timeout = DEFALT_TIMEOUT)

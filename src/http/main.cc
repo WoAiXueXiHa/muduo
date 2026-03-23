@@ -54,7 +54,6 @@ void Login(const HttpRequest &req, HttpResponse *rsp)
 
 int main()
 {
-    // 监听 8080 端口
     HttpServer server(3389); //
     server.setThreadCnt(3); // 开启三个子 EventLoop 线程处理业务
     
