@@ -60,9 +60,32 @@ private:
 
 } // namespace muduo
 
-#define LOG_DEBUG(msg) muduo::Logger::instance().log(muduo::DEBUG, __FILE__, __LINE__, msg)
-#define LOG_INFO(msg)  muduo::Logger::instance().log(muduo::INFO,  __FILE__, __LINE__, msg)
-#define LOG_WARN(msg)  muduo::Logger::instance().log(muduo::WARN,  __FILE__, __LINE__, msg)
-#define LOG_ERROR(msg) muduo::Logger::instance().log(muduo::ERROR, __FILE__, __LINE__, msg)
+#include <cstdio>
+#include <cstring>
+
+// 支持 printf 风格格式化：LOG_INFO("fd=%d err=%s", fd, strerror(errno))
+#define LOG_DEBUG(fmt, ...) do { \
+    char _log_buf[1024]; \
+    snprintf(_log_buf, sizeof(_log_buf), fmt, ##__VA_ARGS__); \
+    muduo::Logger::instance().log(muduo::DEBUG, __FILE__, __LINE__, _log_buf); \
+} while(0)
+
+#define LOG_INFO(fmt, ...) do { \
+    char _log_buf[1024]; \
+    snprintf(_log_buf, sizeof(_log_buf), fmt, ##__VA_ARGS__); \
+    muduo::Logger::instance().log(muduo::INFO, __FILE__, __LINE__, _log_buf); \
+} while(0)
+
+#define LOG_WARN(fmt, ...) do { \
+    char _log_buf[1024]; \
+    snprintf(_log_buf, sizeof(_log_buf), fmt, ##__VA_ARGS__); \
+    muduo::Logger::instance().log(muduo::WARN, __FILE__, __LINE__, _log_buf); \
+} while(0)
+
+#define LOG_ERROR(fmt, ...) do { \
+    char _log_buf[1024]; \
+    snprintf(_log_buf, sizeof(_log_buf), fmt, ##__VA_ARGS__); \
+    muduo::Logger::instance().log(muduo::ERROR, __FILE__, __LINE__, _log_buf); \
+} while(0)
 
 #endif
